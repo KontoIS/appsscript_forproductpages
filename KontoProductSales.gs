@@ -197,6 +197,13 @@ function refreshSalesCount() {
 
 // ============================================================
 //  WRITE ATTENDEES TO SHEET
+//
+//  Handles the `fields` array added to the Attend Object:
+//    fields: [{"label": "Field Name", "value": "Field Value"}, ...]
+//
+//  Each unique custom field label becomes its own column,
+//  inserted after the standard columns. The raw `fields`
+//  array column is hidden — only the expanded values appear.
 // ============================================================
 function writeAttendeesToSheet(sheet, attendees, guid) {
   // Clear previous data rows (keep header rows 1–3)
@@ -212,24 +219,75 @@ function writeAttendeesToSheet(sheet, attendees, guid) {
     return;
   }
 
-  // Derive column headers from the first record's keys
-  var headers = Object.keys(attendees[0]);
+  // --- Collect standard field names (everything except `fields`) ---
+  var standardHeaders = Object.keys(attendees[0]).filter(function(k) {
+    return k !== "fields";
+  });
 
+  // --- Collect all unique custom field labels across all attendees ---
+  // Preserves order of first appearance so columns are stable across refreshes
+  var customLabelsSeen = {};
+  var customLabels = [];
+  attendees.forEach(function(a) {
+    if (Array.isArray(a.fields)) {
+      a.fields.forEach(function(f) {
+        if (f.label && !customLabelsSeen[f.label]) {
+          customLabelsSeen[f.label] = true;
+          customLabels.push(f.label);
+        }
+      });
+    }
+  });
+
+  // Full header row: standard columns + one column per custom field label
+  var headers = standardHeaders.concat(customLabels);
+
+  // --- Write header row at row 4 ---
   var headerRange = sheet.getRange(4, 1, 1, headers.length);
   headerRange.setValues([headers]);
   headerRange.setFontWeight("bold").setBackground("#1a73e8").setFontColor("#ffffff");
 
+  // Highlight custom field columns in a slightly lighter blue so they stand out
+  if (customLabels.length > 0) {
+    var customStart = standardHeaders.length + 1;
+    sheet.getRange(4, customStart, 1, customLabels.length)
+         .setBackground("#4a90d9");
+  }
+
+  // --- Build data rows ---
   var rows = attendees.map(function(a) {
-    return headers.map(function(h) {
+    // Standard columns
+    var row = standardHeaders.map(function(h) {
       var v = a[h];
       return v === null || v === undefined ? "" : v;
     });
+
+    // Custom field columns — look up each label in the attendee's fields array
+    if (customLabels.length > 0) {
+      // Build a quick lookup map for this attendee's custom fields
+      var fieldMap = {};
+      if (Array.isArray(a.fields)) {
+        a.fields.forEach(function(f) {
+          if (f.label) { fieldMap[f.label] = f.value || ""; }
+        });
+      }
+      customLabels.forEach(function(label) {
+        row.push(fieldMap[label] !== undefined ? fieldMap[label] : "");
+      });
+    }
+
+    return row;
   });
 
   sheet.getRange(5, 1, rows.length, headers.length).setValues(rows);
   for (var i = 1; i <= headers.length; i++) { sheet.autoResizeColumn(i); }
 
-  SpreadsheetApp.getActive().toast("✅ " + attendees.length + " attendees loaded", "Konto", 5);
+  var customNote = customLabels.length > 0
+    ? " (" + customLabels.length + " custom field" + (customLabels.length > 1 ? "s" : "") + ")"
+    : "";
+  SpreadsheetApp.getActive().toast(
+    "✅ " + attendees.length + " attendees loaded" + customNote, "Konto", 5
+  );
 }
 
 // ============================================================
