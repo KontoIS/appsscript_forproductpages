@@ -196,36 +196,38 @@ function refreshSalesCount() {
 }
 
 // ============================================================
-//  WRITE ATTENDEES TO SHEET
+//  WRITE ATTENDEES TO SHEET  (merge mode)
 //
-//  Handles the `fields` array added to the Attend Object:
-//    fields: [{"label": "Field Name", "value": "Field Value"}, ...]
+//  Safe to run repeatedly without losing manual edits:
 //
-//  Each unique custom field label becomes its own column,
-//  inserted after the standard columns. The raw `fields`
-//  array column is hidden — only the expanded values appear.
+//  • API columns (standard + custom fields) are refreshed
+//    in-place for rows that already exist, matched by
+//    invoice_number.
+//  • Any columns the user has added to the RIGHT of the API
+//    columns are never touched — notes, checkboxes, formulas
+//    all survive a sync.
+//  • New registrations from the API are appended at the bottom.
+//  • The raw `fields` array is expanded — each unique label
+//    becomes its own column (highlighted in lighter blue).
+//
+//  Merge key: invoice_number  (unique per registration)
 // ============================================================
 function writeAttendeesToSheet(sheet, attendees, guid) {
-  // Clear previous data rows (keep header rows 1–3)
-  var lastRow = sheet.getLastRow();
-  if (lastRow > 4) {
-    sheet.getRange(5, 1, lastRow - 4, sheet.getLastColumn()).clearContent();
-  }
   sheet.getRange("D2").setValue(new Date()); // timestamp
 
   if (attendees.length === 0) {
-    sheet.getRange("A5").setValue("No attendees found for this product sale.");
     SpreadsheetApp.getActive().toast("No attendees found.", "Konto", 4);
     return;
   }
 
-  // --- Collect standard field names (everything except `fields`) ---
+  // ── 1. Build column definitions ───────────────────────────
+
+  // Standard API fields (strip the raw `fields` array — we expand it below)
   var standardHeaders = Object.keys(attendees[0]).filter(function(k) {
     return k !== "fields";
   });
 
-  // --- Collect all unique custom field labels across all attendees ---
-  // Preserves order of first appearance so columns are stable across refreshes
+  // Collect all unique custom field labels, in order of first appearance
   var customLabelsSeen = {};
   var customLabels = [];
   attendees.forEach(function(a) {
@@ -239,54 +241,116 @@ function writeAttendeesToSheet(sheet, attendees, guid) {
     }
   });
 
-  // Full header row: standard columns + one column per custom field label
-  var headers = standardHeaders.concat(customLabels);
+  // Full set of API-owned headers
+  var apiHeaders = standardHeaders.concat(customLabels);
+  var apiColCount = apiHeaders.length;
 
-  // --- Write header row at row 4 ---
-  var headerRange = sheet.getRange(4, 1, 1, headers.length);
-  headerRange.setValues([headers]);
+  // Index of the merge key within apiHeaders
+  var keyCol = apiHeaders.indexOf("invoice_number");
+  if (keyCol === -1) { keyCol = 0; } // fallback to first column
+
+  // ── 2. Read what's already in the sheet ──────────────────
+
+  var lastRow    = sheet.getLastRow();
+  var totalCols  = Math.max(sheet.getLastColumn(), apiColCount);
+  var existingHeaders = [];
+  var rowIndex   = {}; // invoice_number → sheet row number (1-based)
+
+  if (lastRow >= 4) {
+    // Read existing header row to know the current column order
+    existingHeaders = sheet.getRange(4, 1, 1, totalCols).getValues()[0];
+  }
+
+  if (lastRow >= 5) {
+    // Map every existing invoice_number to its row number
+    var keySheetCol = existingHeaders.indexOf("invoice_number");
+    if (keySheetCol === -1) { keySheetCol = 0; }
+    var keyData = sheet.getRange(5, keySheetCol + 1, lastRow - 4, 1).getValues();
+    keyData.forEach(function(r, i) {
+      if (r[0] !== "") { rowIndex[String(r[0])] = 5 + i; }
+    });
+  }
+
+  // ── 3. Write / update header row ─────────────────────────
+
+  // Merge: keep any user-added columns that come after the API columns
+  var userHeaders = [];
+  if (existingHeaders.length > apiColCount) {
+    userHeaders = existingHeaders.slice(apiColCount).filter(function(h) {
+      return h !== "";
+    });
+  }
+  var allHeaders = apiHeaders.concat(userHeaders);
+
+  var headerRange = sheet.getRange(4, 1, 1, allHeaders.length);
+  headerRange.setValues([allHeaders]);
   headerRange.setFontWeight("bold").setBackground("#1a73e8").setFontColor("#ffffff");
 
-  // Highlight custom field columns in a slightly lighter blue so they stand out
+  // Lighter blue for custom field columns
   if (customLabels.length > 0) {
-    var customStart = standardHeaders.length + 1;
-    sheet.getRange(4, customStart, 1, customLabels.length)
+    sheet.getRange(4, standardHeaders.length + 1, 1, customLabels.length)
          .setBackground("#4a90d9");
   }
 
-  // --- Build data rows ---
-  var rows = attendees.map(function(a) {
-    // Standard columns
+  // ── 4. Build a helper: attendee object → API value array ──
+
+  function buildApiRow(a) {
     var row = standardHeaders.map(function(h) {
       var v = a[h];
       return v === null || v === undefined ? "" : v;
     });
-
-    // Custom field columns — look up each label in the attendee's fields array
     if (customLabels.length > 0) {
-      // Build a quick lookup map for this attendee's custom fields
       var fieldMap = {};
       if (Array.isArray(a.fields)) {
         a.fields.forEach(function(f) {
-          if (f.label) { fieldMap[f.label] = f.value || ""; }
+          if (f.label) { fieldMap[f.label] = f.value !== undefined ? f.value : ""; }
         });
       }
       customLabels.forEach(function(label) {
         row.push(fieldMap[label] !== undefined ? fieldMap[label] : "");
       });
     }
-
     return row;
+  }
+
+  // ── 5. Merge: update existing rows, collect new ones ──────
+
+  var newAttendees = [];
+
+  attendees.forEach(function(a) {
+    var key    = String(a.invoice_number || a[standardHeaders[0]] || "");
+    var apiRow = buildApiRow(a);
+
+    if (rowIndex[key] !== undefined) {
+      // Row already exists — update only the API columns, leave user columns alone
+      sheet.getRange(rowIndex[key], 1, 1, apiColCount).setValues([apiRow]);
+    } else {
+      // New registration — queue for append
+      newAttendees.push(apiRow);
+    }
   });
 
-  sheet.getRange(5, 1, rows.length, headers.length).setValues(rows);
-  for (var i = 1; i <= headers.length; i++) { sheet.autoResizeColumn(i); }
+  // ── 6. Append new rows ────────────────────────────────────
 
-  var customNote = customLabels.length > 0
-    ? " (" + customLabels.length + " custom field" + (customLabels.length > 1 ? "s" : "") + ")"
+  if (newAttendees.length > 0) {
+    var appendStart = Math.max(lastRow + 1, 5);
+    sheet.getRange(appendStart, 1, newAttendees.length, apiColCount)
+         .setValues(newAttendees);
+  }
+
+  // ── 7. Auto-resize API columns only ──────────────────────
+
+  for (var i = 1; i <= apiColCount; i++) { sheet.autoResizeColumn(i); }
+
+  // ── 8. Toast ─────────────────────────────────────────────
+
+  var updatedCount = attendees.length - newAttendees.length;
+  var customNote   = customLabels.length > 0
+    ? " · " + customLabels.length + " custom field" + (customLabels.length > 1 ? "s" : "")
     : "";
   SpreadsheetApp.getActive().toast(
-    "✅ " + attendees.length + " attendees loaded" + customNote, "Konto", 5
+    "✅ " + updatedCount + " updated · " + newAttendees.length + " new" + customNote,
+    "Konto", 6
   );
 }
 
