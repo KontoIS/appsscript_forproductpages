@@ -110,8 +110,9 @@ function showProductPicker() {
 
 // ============================================================
 //  FETCH ATTENDEES
-//  Fetches all pages of attendees for the given product GUID
-//  and writes them to the Attendees sheet.
+//  Fetches all pages of attendees for the given product GUID,
+//  enriches each row with customer address data via kennitala,
+//  then writes to the Attendees sheet.
 // ============================================================
 function fetchAndWriteAttendees(guid) {
   var sheet = getOrCreateSheet(SHEET_ATTENDEES);
@@ -131,7 +132,7 @@ function fetchAndWriteAttendees(guid) {
       var rows = extractArray(data);
       if (rows.length === 0) break;
       allAttendees = allAttendees.concat(rows);
-      if (rows.length < CONFIG.PAGE_SIZE) break; // reached last page
+      if (rows.length < CONFIG.PAGE_SIZE) break;
       page++;
     } catch (e) {
       logError(sheet, "get-product-sale-attends (page " + page + ")", e);
@@ -139,7 +140,128 @@ function fetchAndWriteAttendees(guid) {
     }
   }
 
+  // Split "attendee" string into attendeeName + attendeeEmail
+  allAttendees = splitAttendeeField(allAttendees);
+
+  // Enrich with customer address data (address, zip, city) via kennitala
+  allAttendees = enrichWithCustomerAddress(allAttendees);
+
   writeAttendeesToSheet(sheet, allAttendees, guid);
+}
+
+// ============================================================
+//  SPLIT ATTENDEE FIELD
+//
+//  The API returns attendee as a single string:
+//    "Gestsson ehf. (thor@gestsson.com)"
+//
+//  This replaces that column with two columns:
+//    attendeeName  → "Gestsson ehf."
+//    attendeeEmail → "thor@gestsson.com"
+//
+//  The two new columns appear in the same position as the
+//  original `attendee` column, preserving column order.
+// ============================================================
+function splitAttendeeField(attendees) {
+  return attendees.map(function(a) {
+    var raw   = (a.attendee || "").trim();
+    var name  = raw;
+    var email = "";
+
+    // Format: "Some Name (email@example.com)"
+    // Split on the LAST "(" in case the name itself contains parentheses
+    var parenIdx = raw.lastIndexOf("(");
+    if (parenIdx !== -1) {
+      name  = raw.substring(0, parenIdx).trim();
+      email = raw.substring(parenIdx + 1).replace(/\)$/, "").trim();
+    }
+
+    // Rebuild the object with attendeeName + attendeeEmail in place of attendee,
+    // preserving the order of all other keys
+    var result = {};
+    Object.keys(a).forEach(function(k) {
+      if (k === "attendee") {
+        result["attendeeName"]  = name;
+        result["attendeeEmail"] = email;
+      } else {
+        result[k] = a[k];
+      }
+    });
+    return result;
+  });
+}
+
+// ============================================================
+//  ENRICH ATTENDEES WITH CUSTOMER ADDRESS
+//
+//  Uses the kennitala from each Attend row to look up the
+//  matching Customer record and pull in address, zip, city.
+//
+//  Deduplicates kennitala first — one API call per unique
+//  person, not one per row — so 40 attendees with 30 unique
+//  kennitala values only costs 30 lookups.
+//
+//  Attendees with no kennitala, or whose kennitala returns
+//  no customer, simply get empty address fields.
+// ============================================================
+function enrichWithCustomerAddress(attendees) {
+  // Collect unique, non-empty kennitala values
+  var seen = {};
+  var uniqueKennitala = [];
+  attendees.forEach(function(a) {
+    var kt = (a.kennitala || "").toString().trim();
+    if (kt && !seen[kt]) {
+      seen[kt] = true;
+      uniqueKennitala.push(kt);
+    }
+  });
+
+  if (uniqueKennitala.length === 0) return attendees;
+
+  SpreadsheetApp.getActive().toast(
+    "Looking up addresses for " + uniqueKennitala.length + " kennitala…", "Konto", 5
+  );
+
+  // Build kennitala → {address, zip, city} lookup map
+  var addressMap = {};
+
+  uniqueKennitala.forEach(function(kt) {
+    try {
+      var data = apiPost("/get-customers-by-kennitala", {
+        kennitala: kt,
+        limit: 1,
+        page:  1
+      });
+      var results = extractArray(data);
+      if (results.length > 0) {
+        var c = results[0];
+        addressMap[kt] = {
+          address: c.address || "",
+          zip:     c.zip     || "",
+          city:    c.city    || ""
+        };
+      } else {
+        addressMap[kt] = { address: "", zip: "", city: "" };
+      }
+    } catch (e) {
+      Logger.log("Address lookup failed for kennitala " + kt + ": " + e.message);
+      addressMap[kt] = { address: "", zip: "", city: "" };
+    }
+  });
+
+  // Merge address fields into each attendee object
+  return attendees.map(function(a) {
+    var kt   = (a.kennitala || "").toString().trim();
+    var addr = kt ? (addressMap[kt] || { address: "", zip: "", city: "" })
+                  : { address: "", zip: "", city: "" };
+    // Spread address fields directly onto the attendee object.
+    // writeAttendeesToSheet will pick them up as regular columns.
+    return Object.assign({}, a, {
+      address: addr.address,
+      zip:     addr.zip,
+      city:    addr.city
+    });
+  });
 }
 
 // ============================================================
